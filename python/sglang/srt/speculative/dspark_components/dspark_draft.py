@@ -189,6 +189,9 @@ def sample_draft_block(
         first_prev_tokens=anchor_tokens,
         hidden_states=draft_hidden,
         sampler=sampler,
+        # Truncated-vocab drafts set this on their markov head so each sampled
+        # draft id is remapped to the target vocab before being fed back.
+        map_prev_tokens=getattr(markov_head, "map_prev_tokens", None),
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
@@ -325,6 +328,29 @@ class DraftBlockProposer:
                 device=device,
                 tp_sync=self._tp_sync,
             )
+
+        # Truncated-vocab drafts (vllm speculators checkpoints) sample in a
+        # smaller draft vocab; remap ids and corrected logits into the target
+        # vocab here so every downstream consumer (verify, accept sampling,
+        # confidence/accept estimation) sees target-space values.
+        draft_to_target = getattr(self.draft_model, "map_draft_to_target", None)
+        if draft_to_target is not None:
+            corrected_logits = draft_block.corrected_logits
+            if corrected_logits is not None:
+                expand_logits = getattr(
+                    self.draft_model, "expand_draft_logits_to_target", None
+                )
+                corrected_logits = (
+                    expand_logits(corrected_logits)
+                    if expand_logits is not None
+                    else None
+                )
+            draft_block = msgspec.structs.replace(
+                draft_block,
+                draft_tokens=draft_to_target(draft_block.draft_tokens),
+                corrected_logits=corrected_logits,
+            )
+
         proposal_block_ids = (
             draft_block_ids
             if self.sample_from_anchor

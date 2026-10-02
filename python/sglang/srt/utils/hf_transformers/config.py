@@ -13,6 +13,7 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +47,8 @@ from .common import (
 )
 from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
+
+logger = logging.getLogger(__name__)
 
 
 def _set_architectures(config, arch_name):
@@ -206,6 +209,86 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     )
 
 
+# vllm-speculators (DFlash/DSpark) draft checkpoints nest the HF backbone
+# config under this key; the top level carries training-side draft fields.
+_SPECULATORS_BACKBONE_CFG_KEY = "transformer_layer_config"
+
+# Draft/head fields sglang reads at serve time; everything else at the speculators
+# top level (speculators_config, auto_map, training metadata) is ignored.
+_SPECULATORS_DRAFT_FIELDS = (
+    "aux_hidden_state_layer_ids",
+    "block_size",
+    "confidence_head_with_markov",
+    "draft_vocab_size",
+    "enable_confidence_head",
+    "markov_head_type",
+    "markov_rank",
+    "mask_token_id",
+    "sample_from_anchor",
+    "sliding_window_non_causal",
+    "speculators_model_type",
+    "speculators_version",
+)
+
+
+def _try_load_speculators_draft_config(
+    model, revision: Optional[str], **kwargs
+) -> Optional[PretrainedConfig]:
+    """Recognize vllm-speculators draft checkpoints (DFlash/DSpark).
+
+    Their training-side ``config.json`` has no top-level ``model_type`` (plus
+    an ``auto_map`` pointing at the ``speculators`` package, unavailable in
+    serving environments), so ``AutoConfig.from_pretrained`` rejects them with
+    "Unrecognized model ... Should have a model_type key". The HF backbone
+    config lives in the nested ``transformer_layer_config`` dict; build the
+    backbone config straight from it (e.g. a Qwen3Config) and lift the
+    serve-time draft fields onto it, without requiring the training package or
+    rewriting the checkpoint.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    if config_dict.get("model_type"):
+        return None
+    backbone_dict = config_dict.get(_SPECULATORS_BACKBONE_CFG_KEY)
+    if not isinstance(backbone_dict, dict) or not backbone_dict.get("model_type"):
+        return None
+
+    backbone_model_type = backbone_dict["model_type"]
+    backbone_kwargs = {
+        key: value
+        for key, value in backbone_dict.items()
+        if key != "model_type" and value is not None
+    }
+    # Training checkpoints store the precision under top-level "dtype"; pass it
+    # as ``torch_dtype`` into the backbone constructor so HF normalizes the
+    # string into a torch.dtype. An explicit value in the backbone config wins.
+    dtype = config_dict.get("dtype")
+    if dtype is not None and "torch_dtype" not in backbone_kwargs:
+        backbone_kwargs["torch_dtype"] = dtype
+    try:
+        config = AutoConfig.for_model(backbone_model_type, **backbone_kwargs)
+    except (KeyError, TypeError, ValueError) as exc:
+        # Unknown backbone model type or incompatible backbone fields: let the
+        # regular AutoConfig path / error handling take over instead of
+        # masking the problem here.
+        logger.debug(
+            "Unable to build a '%s' backbone config for a speculators draft; "
+            "falling back to default config resolution: %s",
+            backbone_model_type,
+            exc,
+        )
+        return None
+    config.architectures = config_dict.get("architectures")
+
+    for key in _SPECULATORS_DRAFT_FIELDS:
+        value = config_dict.get(key)
+        if value is not None:
+            setattr(config, key, value)
+
+    return config
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -218,6 +301,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_speculators_draft_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,

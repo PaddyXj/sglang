@@ -132,7 +132,9 @@ class DsparkDraftSampler:
         )
         if not self.folded_sampling and fused_greedy:
             draft_tokens = self.markov_head.sample_block_greedy_fused(
-                base_logits, first_prev_tokens=anchor
+                base_logits,
+                first_prev_tokens=anchor,
+                map_prev_tokens=getattr(self.markov_head, "map_prev_tokens", None),
             )
 
         if draft_tokens is None:
@@ -167,6 +169,7 @@ class DsparkDraftSampler:
                 hidden_states=sample_hidden,
                 sampler=sampler,
                 collect_corrected=self.folded_sampling,
+                map_prev_tokens=getattr(self.markov_head, "map_prev_tokens", None),
             )
             if self.folded_sampling:
                 self.corrected_out[: bs * self.gamma].copy_(

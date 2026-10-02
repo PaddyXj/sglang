@@ -265,7 +265,24 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
-            if get_parallel().tp_rank == 0:
+            if getattr(self.draft_model, "borrow_target_embedding", False):
+                # Own truncated-vocab lm_head, but the target embedding: the
+                # draft graph embeds mask/anchor tokens via forward_embed, so
+                # the target table must be attached (vllm speculators drafts
+                # are trained against the target embedding).
+                target_model = self.target_worker.model_runner.model
+                self.draft_model.attach_shared_modules(
+                    embed_tokens=unwrap_lora_layer(
+                        self._resolve_target_embed_tokens(target_model)
+                    ),
+                    lm_head=None,
+                )
+                if get_parallel().tp_rank == 0:
+                    logger.info(
+                        "DSpark draft uses its checkpoint-local LM head and "
+                        "borrows the target embedding."
+                    )
+            elif get_parallel().tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
                 )

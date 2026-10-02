@@ -14,9 +14,11 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -57,6 +59,7 @@ def run_markov_block(
     hidden_states: Optional[torch.Tensor],
     sampler: StepSampler,
     collect_corrected: bool = True,
+    map_prev_tokens: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     batch_size, proposal_len = base_logits.shape[:2]
     if proposal_len == 0:
@@ -77,7 +80,12 @@ def run_markov_block(
         sampled_tokens.append(next_tokens)
         if collect_corrected:
             corrected_logits.append(step_logits.unsqueeze(1))
-        prev_tokens = next_tokens
+        # Truncated-vocab drafts sample in the draft vocab but condition the
+        # next step on the *target*-vocab embedding table (markov_w1); remap
+        # before feeding back.
+        prev_tokens = (
+            map_prev_tokens(next_tokens) if map_prev_tokens is not None else next_tokens
+        )
     return (
         torch.stack(sampled_tokens, dim=1),
         torch.cat(corrected_logits, dim=1) if collect_corrected else None,
@@ -87,16 +95,25 @@ def run_markov_block(
 class VanillaMarkov(nn.Module):
     markov_head_type = "vanilla"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        out_vocab_size: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
+        # Truncated-vocab drafts (vllm speculators format): w1 embeds
+        # target-vocab ids while w2 emits a draft-vocab bias.
+        self.out_vocab_size = int(out_vocab_size) if out_vocab_size else self.vocab_size
         if self.markov_rank <= 0:
             raise ValueError(
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.out_vocab_size, bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -140,6 +157,7 @@ class VanillaMarkov(nn.Module):
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
         collect_corrected: bool = True,
+        map_prev_tokens: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
@@ -148,6 +166,7 @@ class VanillaMarkov(nn.Module):
             hidden_states=hidden_states,
             sampler=sampler,
             collect_corrected=collect_corrected,
+            map_prev_tokens=map_prev_tokens,
         )
 
     def sample_block_greedy_fused(
@@ -155,6 +174,7 @@ class VanillaMarkov(nn.Module):
         base_logits: torch.Tensor,
         *,
         first_prev_tokens: torch.Tensor,
+        map_prev_tokens: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> Optional[torch.Tensor]:
         """Greedy-only draft-block sampling via the fused per-step
         [bias-dot + add + argmax] kernel (see MarkovGreedyStep) — one pass over
@@ -176,12 +196,17 @@ class VanillaMarkov(nn.Module):
         prev_tokens = first_prev_tokens.long()
         for step_idx in range(proposal_len):
             prev_embeds = self.get_prev_embeddings(prev_tokens)
-            prev_tokens = MarkovGreedyStep.execute(
+            next_tokens = MarkovGreedyStep.execute(
                 base_logits=base_logits[:, step_idx, :],
                 prev_embeds=prev_embeds,
                 w2_weight=self.markov_w2.weight,
             )
-            sampled_tokens.append(prev_tokens)
+            sampled_tokens.append(next_tokens)
+            prev_tokens = (
+                map_prev_tokens(next_tokens)
+                if map_prev_tokens is not None
+                else next_tokens
+            )
         return torch.stack(sampled_tokens, dim=1)
 
 
@@ -381,8 +406,15 @@ def build_markov_head(config) -> Optional[nn.Module]:
     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
     vocab_size = int(config.vocab_size)
     hidden_size = int(config.hidden_size)
+    # Truncated-vocab drafts (vllm speculators format): w1 stays in the target
+    # vocab, w2 emits a draft-vocab bias.
+    draft_vocab_size = getattr(config, "draft_vocab_size", None)
     if markov_head_type == "vanilla":
-        return VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+        return VanillaMarkov(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            out_vocab_size=draft_vocab_size,
+        )
     if markov_head_type == "gated":
         return GatedMarkovHead(
             vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
@@ -883,4 +915,135 @@ class LingDSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel, LingDSparkModel, DSparkDraftModel]
+class SpeculatorsDSparkDraftModel(DSparkDraftModel):
+    """DSpark draft trained with the vllm ``speculators`` framework.
+
+    Such a checkpoint is target-agnostic by itself; what distinguishes it from
+    the bundled DSpark drafts is a *truncated* draft vocabulary
+    (``0 < draft_vocab_size < vocab_size``):
+
+      * it carries its own ``lm_head`` (``draft_vocab_size`` x hidden) instead
+        of borrowing the target head,
+      * a ``d2t`` (draft-id -> target-id additive map) buffer,
+      * a Markov head whose ``markov_w1`` embeds *target*-vocab ids while
+        ``markov_w2`` emits a *draft*-vocab bias.
+
+    The draft samples in the smaller draft-vocab space; sampled ids are mapped
+    to target ids via ``d2t`` before verification (``map_draft_to_target`` /
+    ``expand_draft_logits_to_target``), and the previous token fed back into
+    the Markov head is remapped as well (the Markov conditioning lives in
+    target-vocab space, matching the speculators training-time behavior).
+
+    ``uses_own_vocab_modules`` keeps the worker from attaching the target
+    lm_head; ``borrow_target_embedding`` still borrows the target embedding
+    (anchor / mask tokens are embedded with the target table).
+    """
+
+    uses_own_vocab_modules = True
+    borrow_target_embedding = True
+
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        draft_vocab_size = int(config.draft_vocab_size)
+        if draft_vocab_size <= 0 or draft_vocab_size > int(config.vocab_size):
+            raise ValueError(
+                "Speculators DSpark draft requires "
+                "0 < draft_vocab_size <= vocab_size, got "
+                f"draft_vocab_size={draft_vocab_size}, "
+                f"vocab_size={config.vocab_size}."
+            )
+        self.draft_vocab_size = draft_vocab_size
+        # The draft's own truncated-vocab lm_head (TP-sharded like the target's).
+        self.lm_head = ParallelLMHead(
+            draft_vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+        )
+        # Additive draft-id -> target-id map (target_id = draft_id + d2t[id]).
+        self.register_buffer(
+            "d2t", torch.zeros(draft_vocab_size, dtype=torch.long), persistent=True
+        )
+        self.draft_target_ids: Optional[torch.Tensor] = None
+        # The Markov head conditions on target-vocab ids: remap each sampled
+        # draft id before feeding it back as the previous token.
+        self.markov_head.map_prev_tokens = self.map_draft_to_target
+
+    def attach_shared_modules(self, *, embed_tokens: nn.Module, lm_head) -> None:
+        # Only borrow the target embedding; the draft keeps its own lm_head.
+        self.embed_tokens = embed_tokens
+
+    def compute_base_logits(self, hidden: torch.Tensor) -> tuple[torch.Tensor, object]:
+        if self.logits_mup_width_multiplier:
+            hidden = hidden / self.logits_mup_width_multiplier
+        local_logits = project_through_lm_head(hidden, self.lm_head)
+        base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
+        return base_logits, None
+
+    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        """Map draft-vocab ids to target-vocab ids (identity rows store 0)."""
+        return draft_ids + self.d2t[draft_ids]
+
+    def expand_draft_logits_to_target(
+        self, corrected_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter draft-vocab logits [bs, gamma, draft_vocab] into the target
+        vocab [bs, gamma, vocab_size]; unmapped positions get -inf."""
+        if self.draft_target_ids is None:
+            self.draft_target_ids = (
+                torch.arange(self.draft_vocab_size, device=self.d2t.device) + self.d2t
+            )
+        bs, gamma, dv = corrected_logits.shape
+        assert dv == self.draft_vocab_size, (
+            f"DSpark draft logits vocab {dv} != draft_vocab_size "
+            f"{self.draft_vocab_size}"
+        )
+        full = corrected_logits.new_full(
+            (bs, gamma, int(self.config.vocab_size)), float("-inf")
+        )
+        index = self.draft_target_ids.view(1, 1, -1).expand(bs, gamma, dv)
+        full.scatter_(-1, index, corrected_logits)
+        return full
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        own_weights = []
+        rest = []
+        for name, loaded_weight in weights:
+            normalized = name.removeprefix("model.")
+            if normalized == "d2t":
+                own_weights.append(("d2t", loaded_weight))
+            elif normalized == "t2d":
+                # Inverse map is unused at serve time.
+                continue
+            elif normalized == "lm_head.weight":
+                # The base class skips "lm_head.*"; this draft owns its head.
+                own_weights.append(("lm_head.weight", loaded_weight))
+            else:
+                rest.append((name, loaded_weight))
+
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in own_weights:
+            if name == "d2t":
+                if tuple(loaded_weight.shape) != tuple(self.d2t.shape):
+                    raise ValueError(
+                        f"DSpark d2t shape mismatch: checkpoint "
+                        f"{tuple(loaded_weight.shape)} != buffer "
+                        f"{tuple(self.d2t.shape)}"
+                    )
+                self.d2t.copy_(loaded_weight.to(torch.long))
+                self.draft_target_ids = None  # recompute lazily
+            else:
+                param = params_dict["lm_head.weight"]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+        super().load_weights(rest)
+
+
+EntryClass = [
+    Qwen3DSparkModel,
+    LingDSparkModel,
+    SpeculatorsDSparkDraftModel,
+    DSparkDraftModel,
+]

@@ -252,7 +252,10 @@ def uses_kda_attention(config) -> bool:
 
 
 def is_dspark_draft(config) -> bool:
-    return _hf_arch(config) == "DSparkDraftModel"
+    return _hf_arch(config) in (
+        "DSparkDraftModel",
+        "SpeculatorsDSparkDraftModel",
+    )
 
 
 def is_qwen3_5(config) -> bool:
@@ -894,6 +897,26 @@ class ModelConfig:
             else:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
+
+        # vllm-speculators DSpark drafts with a truncated draft vocab carry
+        # their own lm_head + draft/target vocab maps; route them to the
+        # generic speculators draft class (the base DSparkDraftModel borrows
+        # the target head). Full-vocab drafts keep the generic arch.
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DSparkDraftModel"
+            and 0
+            < int(getattr(self.hf_config, "draft_vocab_size", 0) or 0)
+            < int(self.hf_config.vocab_size)
+        ):
+            self.hf_config.architectures[0] = "SpeculatorsDSparkDraftModel"
+            logger.info(
+                "Truncated-vocab speculators DSpark draft "
+                "(draft_vocab_size=%s < vocab_size=%s); loading draft arch "
+                "SpeculatorsDSparkDraftModel.",
+                self.hf_config.draft_vocab_size,
+                self.hf_config.vocab_size,
+            )
 
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"

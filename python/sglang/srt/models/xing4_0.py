@@ -766,6 +766,13 @@ class Xing4_0Model(nn.Module):
 
         self.hc_mult = getattr(config, "hc_mult", 1)
 
+        # Hidden-state capture for DSpark speculative decoding. When enabled,
+        # ``forward`` appends each captured layer's multi-stream-mean hidden
+        # state (shape [N, hidden_size]) to an aux list and returns
+        # ``(hidden_states, aux_hidden_states)``.
+        self.layers_to_capture: list[int] | None = None
+        self.capture_aux_hidden_states = False
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -811,6 +818,19 @@ class Xing4_0Model(nn.Module):
             device=device,
         )
 
+        # DSpark aux capture: only the dspark target-side forwards that ask
+        # for hidden states pay the capture cost.
+        capture_mode = forward_batch.capture_hidden_mode
+        capture_aux = (
+            self.capture_aux_hidden_states
+            and self.pp_group.is_last_rank
+            and self.layers_to_capture is not None
+            and capture_mode is not None
+            and capture_mode.need_capture()
+        )
+        if capture_aux:
+            dspark_aux_hidden_states: list[torch.Tensor] = []
+
         topk_indices = None
         for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
@@ -823,6 +843,20 @@ class Xing4_0Model(nn.Module):
                 zero_allocator=zero_allocator,
                 prev_topk_indices=topk_indices,
             )
+            if (
+                capture_aux
+                and layer.layer_id in self.layers_to_capture
+                and hidden_states.shape[0] != 0
+            ):
+                # Match the vllm training-time semantics: the aux state is the
+                # multi-stream hidden entering the next layer, contracted by
+                # the stream mean (output_contract); no separate residual.
+                if n_streams > 1:
+                    dspark_aux_hidden_states.append(
+                        output_contract(hidden_states, n_streams).reshape(S, C)
+                    )
+                else:
+                    dspark_aux_hidden_states.append(hidden_states)
 
         if not self.pp_group.is_last_rank:
             return hidden_states
@@ -832,6 +866,8 @@ class Xing4_0Model(nn.Module):
             hidden_states = hidden_states.reshape(S, C)
 
         hidden_states = self.norm(hidden_states)
+        if capture_aux:
+            return hidden_states, dspark_aux_hidden_states
         return hidden_states
 
 
@@ -907,6 +943,28 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def end_layer(self):
         return self.model.end_layer
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Configure per-layer hidden-state capture for DSpark.
+
+        ``layer_ids`` are target decoder layer indices and capture happens
+        after layer ``i`` runs (multi-stream mean via output_contract, no
+        separate residual), matching the vllm training-time convention for
+        Xing4.0: HF layer-input ids [1,10,19,28,37] map to the layer-output
+        ids [0,9,18,27,36] used here.
+        """
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        self.model.layers_to_capture = list(layer_ids)
+
     @torch.no_grad()
     def forward(
         self,
@@ -924,8 +982,15 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
 
         if self.pp_group.is_last_rank:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
+                hidden_states, aux_hidden_states = hidden_states
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, None
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states
