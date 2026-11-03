@@ -14,6 +14,8 @@ def _table_qk_norm_rope_kernel(
     q_size,
     NHQ: tl.constexpr,
     D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     EPS: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
@@ -21,10 +23,16 @@ def _table_qk_norm_rope_kernel(
     pos = tl.load(pos_ptr + t).to(tl.int64)
 
     HALF: tl.constexpr = D // 2
-    half_ar = tl.arange(0, HALF)
-    d_ar = tl.arange(0, D)
-    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
+    half_ar = tl.arange(0, BLOCK_H)
+    h_mask = half_ar < HALF
+    d_ar = tl.arange(0, BLOCK_D)
+    d_mask = d_ar < D
+    cos = tl.load(cos_sin_ptr + pos * D + half_ar, mask=h_mask, other=0.0).to(
+        tl.float32
+    )
+    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar, mask=h_mask, other=0.0).to(
+        tl.float32
+    )
 
     is_q = h < NHQ
     col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
@@ -33,19 +41,19 @@ def _table_qk_norm_rope_kernel(
     )
 
     row = qkv_ptr + t * row_stride + col0
-    x = tl.load(row + d_ar).to(tl.float32)
+    x = tl.load(row + d_ar, mask=d_mask, other=0.0).to(tl.float32)
     ms = tl.sum(x * x, 0) / D
     inv = 1.0 / tl.sqrt(ms + EPS)
-    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
-    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+    w1 = tl.load(w_ptr + half_ar, mask=h_mask, other=0.0).to(tl.float32)
+    w2 = tl.load(w_ptr + HALF + half_ar, mask=h_mask, other=0.0).to(tl.float32)
+    x1 = tl.load(row + half_ar, mask=h_mask, other=0.0).to(tl.float32) * inv * w1
+    x2 = tl.load(row + HALF + half_ar, mask=h_mask, other=0.0).to(tl.float32) * inv * w2
     x1 = x1.to(tl.bfloat16).to(tl.float32)
     x2 = x2.to(tl.bfloat16).to(tl.float32)
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
-    tl.store(row + half_ar, o1.to(tl.bfloat16))
-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
+    tl.store(row + half_ar, o1.to(tl.bfloat16), mask=h_mask)
+    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16), mask=h_mask)
 
 
 def table_qk_norm_rope_(
@@ -79,5 +87,7 @@ def table_qk_norm_rope_(
         num_q_heads * head_dim,
         NHQ=num_q_heads,
         D=head_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_H=triton.next_power_of_2(max(head_dim // 2, 1)),
         EPS=eps,
     )

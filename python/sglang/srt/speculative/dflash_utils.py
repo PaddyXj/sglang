@@ -733,6 +733,30 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
     )
+    if layer_ids is None:
+        # vllm-speculators checkpoints store 1-indexed HF hidden-state layer
+        # ids (0 = embedding output, i = output of decoder layer i-1) under
+        # ``aux_hidden_state_layer_ids``; sglang uses 0-indexed decoder layer
+        # ids under ``target_layer_ids``.
+        aux_layer_ids = _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None)
+        if aux_layer_ids is not None:
+            if not isinstance(aux_layer_ids, (list, tuple)) or not len(aux_layer_ids):
+                raise ValueError(
+                    "DFLASH aux_hidden_state_layer_ids must be a non-empty list "
+                    f"of ints, got {aux_layer_ids!r}."
+                )
+            layer_ids = [int(x) - 1 for x in aux_layer_ids]
+            if any(x < 0 for x in layer_ids):
+                raise ValueError(
+                    "DFLASH aux_hidden_state_layer_ids entries must be >= 1 "
+                    "(0-indexed target layer would be negative)."
+                )
+            logger.info(
+                "DFLASH derived target_layer_ids=%s from speculators "
+                "aux_hidden_state_layer_ids=%s (minus 1).",
+                layer_ids,
+                list(aux_layer_ids),
+            )
     parsed_target_layer_ids: Optional[List[int]]
     if layer_ids is None:
         parsed_target_layer_ids = None
