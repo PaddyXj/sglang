@@ -16,8 +16,8 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.utils.hf_transformers.config import (
     _try_load_speculators_draft_config,
+    get_config,
 )
-from sglang.srt.utils.hf_transformers_utils import get_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
